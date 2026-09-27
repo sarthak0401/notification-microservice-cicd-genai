@@ -482,13 +482,11 @@ $RECYCLE.BIN/
 *.swp
 
 
-# Removing the firebase-key
+# Secrets — never commit, never bake into image
 firebase-key.json
-
-
-SESSION_SUMMARY_NOTIFICATION_MICROSERVICE.md
-setup_db.sql
-docs/ARCHITECTURE_FLOW.md
-docs/IMPLEMENTATION_STRATEGY.md
-docs/INTERVIEW_PREP.md
-BRD_NotificationMicroservice.md
+appsettings.Development.json
+.env
+.env.*
+secrets/
+*.pfx
+*.pem

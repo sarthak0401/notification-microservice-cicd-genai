@@ -5,11 +5,11 @@ using MassTransit;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.OpenApi.Models;
-using NotificationMicroservice.Data;
+using NotificationMicroservice.Configuration;
 using NotificationMicroservice.Consumers;
+using NotificationMicroservice.Data;
 using NotificationMicroservice.Services;
 using Serilog;
-using NotificationMicroservice.Configuration;
 
 Log.Logger = new LoggerConfiguration()
     .WriteTo.Console()
@@ -58,6 +58,12 @@ builder.Services.AddScoped<IPushNotificationService, FcmPushNotificationService>
 builder.Services.AddScoped<IDeviceTokenService, DeviceTokenServiceImpl>();
 builder.Services.AddScoped<INotificationService, NotificationServiceImpl>();
 
+
+
+var rabbitHost = builder.Configuration["RabbitMQ:Host"];
+var rabbitUser = builder.Configuration["RabbitMQ:Username"];
+var rabbitPass = builder.Configuration["RabbitMQ:Password"];
+
 // Configure MassTransit with RabbitMQ
 builder.Services.AddMassTransit(x =>
 {
@@ -66,10 +72,10 @@ builder.Services.AddMassTransit(x =>
 
     x.UsingRabbitMq((context, cfg) =>
     {
-        cfg.Host("localhost", "/", h =>
+        cfg.Host(rabbitHost, "/", h =>
         {
-            h.Username("guest");
-            h.Password("guest");
+            h.Username(rabbitUser!);
+            h.Password(rabbitPass!);
         });
 
         cfg.ReceiveEndpoint("push_notifications_queue", e =>
@@ -161,5 +167,14 @@ app.UseHttpsRedirection();
 app.UseAuthentication();
 app.UseAuthorization();
 app.MapControllers();
+
+app.MapGet("/health", () =>
+{
+    return Results.Ok(new
+    {
+        status = "Healthy",
+        service = "NotificationMicroservice"
+    });
+});
 
 app.Run();

@@ -1,0 +1,15 @@
+bin/
+obj/
+out/
+.vs/
+.vscode/
+.git/
+.gitignore
+Dockerfile*
+docker-compose*.yml
+*.md
+docs/
+.env
+firebase-key.json
+appsettings.Development.json
+secrets/

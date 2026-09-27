@@ -139,7 +139,7 @@ Email (`Contracts/SendEmailEvent.cs` - `[EntityName("send_email_exchange")]`):
 
 ```bash
 docker start rabbitmq sqlserver
-cd /home/sarthak/IProject/NotificationMicroservice
+cd /home/sarthak/PersonalProjects/NotificationMicroservice
 dotnet run  # :5011
 ```
 
