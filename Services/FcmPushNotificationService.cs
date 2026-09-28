@@ -65,6 +65,7 @@ namespace NotificationMicroservice.Services
                             Priority = NotificationPriority.HIGH,
                             DefaultSound = true,
                             DefaultVibrateTimings = true,
+                            EventTimestamp = DateTime.UtcNow,
                         },
                     },
                 })

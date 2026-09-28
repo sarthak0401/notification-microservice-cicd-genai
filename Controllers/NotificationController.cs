@@ -169,6 +169,7 @@ namespace NotificationMicroservice.Controllers
                             Priority = FirebaseAdmin.Messaging.NotificationPriority.HIGH,
                             DefaultSound = true,
                             DefaultVibrateTimings = true,
+                            EventTimestamp = DateTime.UtcNow,
                             ChannelId = channelId
                         }
                     }
