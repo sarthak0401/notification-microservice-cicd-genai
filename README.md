@@ -126,6 +126,30 @@ Email (`Contracts/SendEmailEvent.cs` - `[EntityName("send_email_exchange")]`):
 - Idempotency: `Notifications.MessageId` + unique index `UX_Notifications_MessageId`.
 - Dead FCM tokens (`Unregistered`/`InvalidArgument`/`SenderIdMismatch`) skipped, not retried.
 
+## Auth (`Controllers/AuthController.cs`)
+
+This service is a **resource server**: it validates JWTs, it never issues them. Token issuance
+belongs to the identity service. `Program.cs` verifies signature, issuer, audience and lifetime
+against `Jwt:Issuer` / `Jwt:Audience` / `Jwt:Key`.
+
+- `GET /api/auth/me` (Auth) - echoes the validated claims; proves forged tokens get 401.
+
+There is intentionally **no token-issuing endpoint** in this service. For local runs, mint a
+token with the dev script, which plays the role of the identity service:
+
+```bash
+python3 scripts/generate-dev-token.py          # prints the token + curl examples
+TOKEN=$(python3 scripts/generate-dev-token.py --quiet)
+curl -s -H "Authorization: Bearer $TOKEN" http://localhost:5011/api/auth/me
+```
+
+The script reads the `Jwt` section from `appsettings.json`, so its signing key can never drift
+from what the service validates. Default `UserRowId` is `11111111-1111-1111-1111-111111111111`.
+
+In production the identity service signs with an **asymmetric** key (RS256/ES256) and this
+service validates using the public key from its JWKS endpoint - so a validating service can
+never mint tokens. The local HS256 shared-secret setup is the simplified same-shape version.
+
 ## Token API (`Controllers/NotificationController.cs`)
 
 - `POST /api/Notification/registerDeviceToken` (Auth)

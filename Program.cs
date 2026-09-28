@@ -1,9 +1,10 @@
-using System.IdentityModel.Tokens.Jwt;
+using System.Text;
 using FirebaseAdmin;
 using Google.Apis.Auth.OAuth2;
 using MassTransit;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.IdentityModel.Tokens;
 using Microsoft.OpenApi.Models;
 using NotificationMicroservice.Configuration;
 using NotificationMicroservice.Consumers;
@@ -102,30 +103,37 @@ builder.Services.AddMassTransit(x =>
 builder.Services.Configure<EmailOptions>(builder.Configuration.GetSection("Email"));
 builder.Services.AddScoped<IEmailService, SmtpEmailService>();
 
-// Bypasses signature validation for local unsigned test tokens
+// JWT: this service is a resource server. It VALIDATES tokens issued by the identity service
+// and never issues them. Locally the identity service is simulated by
+// scripts/generate-dev-token.py, which signs with the same Jwt:Key below.
+var jwtSection = builder.Configuration.GetSection("Jwt");
+builder.Services.Configure<JwtOptions>(jwtSection);
+
+var jwtOptions = jwtSection.Get<JwtOptions>() ?? new JwtOptions();
+if (string.IsNullOrWhiteSpace(jwtOptions.Key) || Encoding.UTF8.GetByteCount(jwtOptions.Key) < 32)
+{
+    Log.Warning(
+        "Jwt:Key is missing or shorter than 32 bytes. HS256 token validation will reject every request."
+    );
+}
+
 builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
     .AddJwtBearer(options =>
     {
-        options.Events = new JwtBearerEvents
+        // Keep claim names exactly as they appear in the token (no legacy inbound remapping).
+        options.MapInboundClaims = false;
+
+        options.TokenValidationParameters = new TokenValidationParameters
         {
-            OnMessageReceived = context =>
-            {
-                var authHeader = context.Request.Headers["Authorization"].FirstOrDefault();
-                if (!string.IsNullOrEmpty(authHeader) && authHeader.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
-                {
-                    var token = authHeader["Bearer ".Length..].Trim();
-                    var handler = new JwtSecurityTokenHandler();
-                    if (handler.CanReadToken(token))
-                    {
-                        var jwt = handler.ReadJwtToken(token);
-                        context.Principal = new System.Security.Claims.ClaimsPrincipal(
-                            new System.Security.Claims.ClaimsIdentity(jwt.Claims, "Bearer")
-                        );
-                        context.Success();
-                    }
-                }
-                return Task.CompletedTask;
-            }
+            ValidateIssuer = true,
+            ValidIssuer = jwtOptions.Issuer,
+            ValidateAudience = true,
+            ValidAudience = jwtOptions.Audience,
+            ValidateIssuerSigningKey = true,
+            IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtOptions.Key)),
+            ValidateLifetime = true,
+            ClockSkew = TimeSpan.FromSeconds(30),
+            NameClaimType = "UserRowId",
         };
     });
 
