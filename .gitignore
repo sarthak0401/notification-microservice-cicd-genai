@@ -490,3 +490,8 @@ appsettings.Development.json
 secrets/
 *.pfx
 *.pem
+
+# Local planning / session docs — never push to GitHub
+BRD_NotificationMicroservice.md
+SESSION_SUMMARY_NOTIFICATION_MICROSERVICE.md
+docs/
