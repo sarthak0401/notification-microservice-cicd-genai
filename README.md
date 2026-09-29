@@ -1,44 +1,54 @@
-# Notification Microservice — .NET + RabbitMQ + FCM + SMTP
+# Notification Microservice
 
-Event-driven microservice that decouples notification delivery from core APIs. Upstream services publish domain events to RabbitMQ, this service consumes them and delivers **Push (FCM)** and **Email (SMTP via MailKit)** reliably with retry + DLQ.
+Event-driven notification delivery service built with **ASP.NET Core 10**. Upstream services publish domain events to **RabbitMQ**; this service consumes them and delivers **push notifications (Firebase Cloud Messaging)** and **emails (SMTP)** with exponential retry, dead-letter queues, and idempotent persistence — so notification delivery never blocks or fails the business operation that triggered it.
 
-> Details + sketches: [`docs/ARCHITECTURE_FLOW.md`](docs/ARCHITECTURE_FLOW.md).
+## Contents
 
-## Stack
-- **.NET 10** Web API (`net10.0`)
-- **MassTransit 8.3.6 + RabbitMQ** — pub/sub, retry + DLQ
-- **FirebaseAdmin 3.6.0** — FCM push via `SendEachAsync`
-- **MailKit 4.18.0 / MimeKit** — SMTP email
-- **EF Core + SQL Server** — `Notifications`, `UserDeviceTokens`
-- **Serilog + Swagger + JWT Bearer**
+- [Why](#why)
+- [Architecture](#architecture)
+- [Tech Stack](#tech-stack)
+- [Reliability Model](#reliability-model)
+- [Authentication](#authentication)
+- [API Reference](#api-reference)
+- [Getting Started](#getting-started)
+- [Docker](#docker)
+- [Roadmap](#roadmap)
 
-## High-Level Architecture
+## Why
+
+Tightly coupling notification delivery to a checkout, comment, or payment flow means SMTP timeouts and FCM outages become *your* service's outages. This service isolates that risk:
+
+- **Producers stay fast** — publish an event, return a 200, done.
+- **Delivery failures never lose data** — 5 exponential retries, then the message lands in a dead-letter queue for inspection/replay.
+- **Duplicate deliveries don't duplicate rows** — a filtered unique index on `Notifications.MessageId` guarantees exactly one notification per event, even when the broker redelivers.
+
+## Architecture
 
 ```mermaid
 graph LR
-    subgraph Producer[Main Application - Producer]
-        A[CommentService / UserService<br/>Notification_Fix - :5267]
+    subgraph Producer["Producer (any stack)"]
+        A["OrderService / CommentService<br/>..."]
     end
-    subgraph MQ[RabbitMQ]
+    subgraph MQ["RabbitMQ"]
         EX1(push_notifications_exchange)
         EX2(send_email_exchange)
         Q1[push_notifications_queue]
-        Q1E[push_notifications_queue_error<br/>DLQ]
+        Q1E["push_notifications_queue_error<br/>(DLQ)"]
         Q2[send_email_queue]
-        Q2E[send_email_queue_error<br/>DLQ]
+        Q2E["send_email_queue_error<br/>(DLQ)"]
         EX1 --> Q1
         EX2 --> Q2
         Q1 -. retry exhausted .-> Q1E
         Q2 -. retry exhausted .-> Q2E
     end
-    subgraph MS[Notification Microservice - :5011]
+    subgraph MS["Notification Microservice :5011"]
         C1[PushNotificationEventConsumer]
         C2[SendEmailEventConsumer]
         SVC1[NotificationServiceImpl]
         FCM[FcmPushNotificationService<br/>SendEachAsync]
         SMTP[SmtpEmailService<br/>MailKit]
         API[Token Management API]
-        DB[(SQL Server - NotificationDb)]
+        DB[(SQL Server<br/>NotificationDb)]
     end
     A -->|Publish PushNotificationEvent| EX1
     A -->|Publish SendEmailEvent| EX2
@@ -47,162 +57,164 @@ graph LR
     SVC1 --> DB
     API <--> DB
     FCM -->|payload| EXT1[Firebase Cloud Messaging]
-    SMTP -->|SMTP| EXT2[Mailpit :1025 local<br/>ZeptoMail :587 prod]
-    EXT1 -->|deliver| PHONE[Mobile App - Real Device Token]
+    SMTP -->|SMTP| EXT2["Mailpit :1025 (local)<br/>ZeptoMail :587 (prod)"]
+    EXT1 -->|deliver| PHONE[Mobile Device]
     PHONE -->|POST registerDeviceToken| API
 ```
 
-Same pattern for Push and Email — only exchange/queue/consumer/sender changes. SMS fits the same way later.
+Push and email follow the identical pattern — only the exchange, queue, consumer, and sender change. SMS can be added as a third consumer without touching existing code.
 
-## Push Dispatch (detail)
+
+### Message flow (push)
 
 ```mermaid
 sequenceDiagram
-    participant Upstream as Main API (Producer)
+    participant Upstream as Producer
     participant Rabbit as RabbitMQ
     participant Consumer as PushNotificationEventConsumer
-    participant DB as SQL Server (NotificationDb)
+    participant DB as SQL Server
     participant FCMsvc as FcmPushNotificationService
     participant FCM as Firebase FCM
     participant Phone as Mobile Device
     Upstream->>Rabbit: Publish PushNotificationEvent<br/>{RecipientUserId, ActorUserId, Type, EntityId}
-    Rabbit->>Consumer: Deliver push_notifications_queue
+    Rabbit->>Consumer: Deliver to push_notifications_queue
     Consumer->>DB: Insert Notification (MessageId idempotency)
-    Consumer->>FCMsvc: SendAsync(recipientUserId, type, entityId)
-    FCMsvc->>DB: SELECT active tokens WHERE UserId=recipient
-    FCMsvc->>FCMsvc: Build Message per token
+    Consumer->>FCMsvc: CreateAndSendAsync(...)
+    FCMsvc->>DB: SELECT active tokens WHERE UserId = recipient
     FCMsvc->>FCM: SendEachAsync(messages)
-    FCM-->>FCMsvc: Per-token success / fail
+    FCM-->>FCMsvc: Per-token success / failure
     FCM->>Phone: Deliver push banner
-    Note over FCMsvc: Unregistered/InvalidArgument = skip<br/>other failures = throw to retry to DLQ
+    Note over FCMsvc: Unregistered/InvalidArgument = skip token<br/>other failures = throw → retry → DLQ
 ```
 
-## Email Dispatch (detail - same pattern)
+## Tech Stack
 
-```mermaid
-sequenceDiagram
-    participant Upstream as Main API (Producer)
-    participant Rabbit as RabbitMQ
-    participant Consumer as SendEmailEventConsumer
-    participant SMTPsvc as SmtpEmailService (MailKit)
-    participant SMTP as SMTP Server
-    Upstream->>Rabbit: Publish SendEmailEvent<br/>{To, Subject, Body, IsHtml}
-    Rabbit->>Consumer: Deliver send_email_queue
-    Consumer->>SMTPsvc: SendEmailAsync(to, subject, body)
-    SMTPsvc->>SMTP: SMTP send (Mailpit :1025 / ZeptoMail :587)
-    Note over SMTPsvc: Throw on failure to retry 5x exponential to send_email_queue_error
-```
+| Component | Choice |
+|---|---|
+| Runtime | .NET 10 (`net10.0`) |
+| Messaging | MassTransit 8.3.6 + RabbitMQ |
+| Push | FirebaseAdmin 3.6.0 (`SendEachAsync`) |
+| Email | MailKit / MimeKit 4.18.0 |
+| Persistence | EF Core 10 + SQL Server |
+| Auth | JWT Bearer (resource server — validates, never issues) |
+| Observability | Serilog (console), `GET /health` |
+| API docs | Swagger / OpenAPI |
+| Container | Multi-stage Dockerfile (SDK → aspnet, port 8080) |
 
-## Design Sketches
+## Reliability Model
 
-Original whiteboard thinking kept in [`docs/ARCHITECTURE_FLOW.md`](docs/ARCHITECTURE_FLOW.md) + `docs/sketches/`. Mermaid above is source of truth, sketches show evolution.
+| Concern | Implementation |
+|---|---|
+| Transient failures | Exponential retry ×5 (1s → 20s, factor 3) on both queues |
+| Poison messages | Retry exhausted → `*_queue_error` DLQ, no silent swallowing |
+| Idempotency | `Notifications.MessageId` + filtered unique index `UX_Notifications_MessageId` |
+| Dead tokens | `Unregistered` / `InvalidArgument` / `SenderIdMismatch` FCM tokens are skipped, not retried |
+| Error propagation | No try/catch swallowing in consumers — exceptions bubble to MassTransit |
+| Config | RabbitMQ host/credentials, JWT, SMTP, DB all read from `appsettings.json` / environment |
 
-| Sketch | File | What it shows |
-|---|---|---|
-| 1 - Main App to RabbitMQ to FCM | `docs/sketches/01-main-app-rabbitmq-fcm.jpg` | Best high-level overview |
-| 2 - 1 Producer to 2 RabbitMQ to 3 Consumers | `docs/sketches/02-producer-broker-consumers.jpg` | Best concept slide |
-| 3 - notification.fcm/.sms/.email routing | `docs/sketches/03-routing-queues-workers.jpg` | Routing idea (MassTransit uses fanout, see arch doc) |
-| 4 - PushNotificationEvent detail flow | `docs/sketches/04-fcm-worker-detail.jpg` | Matches NotificationServiceImpl + FcmPushNotificationService |
+## Authentication
 
-> Save your 4 photos with exactly those filenames. Compress before commit.
+This service is a **resource server**: it validates JWTs (signature, issuer, audience, lifetime) and deliberately has **no token-issuing endpoint**. Token issuance belongs to an identity service.
 
-## Event Contracts
-
-Push (`Contracts/PushNotificationEvent.cs` - `[EntityName("push_notifications_exchange")]`):
-```json
-{ "RecipientUserId": "guid", "ActorUserId": "guid", "Type": "CommentLike", "EntityId": "guid" }
-```
-
-Email (`Contracts/SendEmailEvent.cs` - `[EntityName("send_email_exchange")]`):
-```json
-{ "To": "user@example.com", "Subject": "string", "Body": "string", "IsHtml": true }
-```
-
-## Reliability
-
-- `Program.cs`: `UseMessageRetry(r => r.Exponential(5, 1s, 20s, 3s))` on both queues.
-- Exhausted -> DLQ: `push_notifications_queue_error`, `send_email_queue_error`.
-- No try/catch swallow in consumers/services - exceptions bubble to MassTransit.
-- Idempotency: `Notifications.MessageId` + unique index `UX_Notifications_MessageId`.
-- Dead FCM tokens (`Unregistered`/`InvalidArgument`/`SenderIdMismatch`) skipped, not retried.
-
-## Auth (`Controllers/AuthController.cs`)
-
-This service is a **resource server**: it validates JWTs, it never issues them. Token issuance
-belongs to the identity service. `Program.cs` verifies signature, issuer, audience and lifetime
-against `Jwt:Issuer` / `Jwt:Audience` / `Jwt:Key`.
-
-- `GET /api/auth/me` (Auth) - echoes the validated claims; proves forged tokens get 401.
-
-There is intentionally **no token-issuing endpoint** in this service. For local runs, mint a
-token with the dev script, which plays the role of the identity service:
+Locally, `scripts/generate-dev-token.py` plays the identity service — it reads the `Jwt` section from `appsettings.json`, so its signing key can never drift from what the service validates:
 
 ```bash
-python3 scripts/generate-dev-token.py          # prints the token + curl examples
+python3 scripts/generate-dev-token.py          # prints token + curl examples
 TOKEN=$(python3 scripts/generate-dev-token.py --quiet)
 curl -s -H "Authorization: Bearer $TOKEN" http://localhost:5011/api/auth/me
 ```
 
-The script reads the `Jwt` section from `appsettings.json`, so its signing key can never drift
-from what the service validates. Default `UserRowId` is `11111111-1111-1111-1111-111111111111`.
 
-In production the identity service signs with an **asymmetric** key (RS256/ES256) and this
-service validates using the public key from its JWKS endpoint - so a validating service can
-never mint tokens. The local HS256 shared-secret setup is the simplified same-shape version.
+## API Reference
 
-## Token API (`Controllers/NotificationController.cs`)
+Base URL (local): `http://localhost:5011`
 
-- `POST /api/Notification/registerDeviceToken` (Auth)
-- `GET /api/Notification/get/deviceTokens` (Auth)
-- `DELETE /api/Notification/del/deviceToken?DeviceToken=xxx` (Auth)
-- `POST /api/Notification/sendTestPush?recipientUserId=guid` (Auth)
-- `POST /api/Notification/publishTestEvent?recipientUserId=guid&type=CommentLike`
-- `POST /api/Notification/test-raw-token?deviceToken=xxx` (Anonymous, raw FCM test)
+### Auth
 
-## Run Locally
+| Method | Endpoint | Auth | Description |
+|---|---|---|---|
+| GET | `/api/Auth/me` | Bearer | Echoes validated claims; forged/expired tokens get 401 |
+| GET | `/health` | — | Liveness probe |
+
+### Device tokens
+
+| Method | Endpoint | Auth | Description |
+|---|---|---|---|
+| POST | `/api/Notification/registerDeviceToken` | Bearer | Register an FCM device token for the current user |
+| GET | `/api/Notification/get/deviceTokens` | Bearer | List the current user's device tokens |
+| DELETE | `/api/Notification/del/deviceToken?DeviceToken=xxx` | Bearer | Remove a device token |
+
+### Notifications
+
+| Method | Endpoint | Auth | Description |
+|---|---|---|---|
+| POST | `/api/Notification/sendTestPush?recipientUserId=guid` | Bearer | Persist + dispatch a test push to the recipient's devices |
+| POST | `/api/Notification/publishTestEvent?recipientUserId=guid&type=CommentLike` | — | Publish a `PushNotificationEvent` to RabbitMQ (full flow test) |
+| POST | `/api/Notification/test-raw-token?deviceToken=xxx` | — | Raw FCM smoke test (bypasses DB) |
+
+## Getting Started
+
+### Prerequisites
+
+- .NET 10 SDK
+- Docker (for RabbitMQ + SQL Server)
+- Python 3 (for the dev token script)
+- `firebase-key.json` — Firebase service account, placed in the project root (gitignored; without it the service starts but push delivery logs a warning)
+
+### Run
 
 ```bash
-docker start rabbitmq sqlserver
-cd /home/sarthak/PersonalProjects/NotificationMicroservice
-dotnet run  # :5011
+# Infrastructure
+docker run -d --name rabbitmq -p 5672:5672 -p 15672:15672 rabbitmq:3-management
+docker run -d --name sqlserver -p 1433:1433 \
+  -e ACCEPT_EULA=Y -e SA_PASSWORD='YourStrong@Pass123' \
+  mcr.microsoft.com/mssql/server:2022-latest
+
+# Schema
+sqlcmd -S localhost,1433 -U sa -P 'YourStrong@Pass123' -i setup_db.sql
+
+# Service
+dotnet run          # http://localhost:5011
 ```
 
-RabbitMQ UI: `http://localhost:15672`.
+Then open `http://localhost:5011/swagger`, mint a token, and hit `registerDeviceToken` → `sendTestPush`.
 
-## Local Producer -> Cloud Microservice (demo)
+RabbitMQ management UI: `http://localhost:15672` (guest/guest).
 
-Producer and consumer never talk directly - both talk to same RabbitMQ:
+### Try the full event-driven flow
 
-```
-Local Producer (laptop) -- AMQP 5672 --> Cloud RabbitMQ
-Cloud Microservice (same RabbitMQ) --> FCM --> Your Phone
-```
+```bash
+TOKEN=$(python3 scripts/generate-dev-token.py --quiet)
 
-```csharp
-cfg.Host(Environment.GetEnvironmentVariable("RABBITMQ_HOST") ?? "localhost", h => {
-    h.Username("..."); h.Password("...");
-});
-```
+# 1. Register a device (real FCM token from the Flutter app)
+curl -X POST http://localhost:5011/api/Notification/registerDeviceToken \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"deviceToken":"<FCM_TOKEN>","devicePlatform":"android"}'
 
-## Mobile App (for real device token)
-
-Emulator tokens do not work. Minimal Flutter app:
-
-```dart
-String? token = await FirebaseMessaging.instance.getToken();
-// show on screen + POST /api/Notification/registerDeviceToken with JWT
+# 2. Publish an event through RabbitMQ — watch the consumer log, then the device
+curl -X POST "http://localhost:5011/api/Notification/publishTestEvent?recipientUserId=<USER_GUID>&type=OrderPlaced"
 ```
 
-Build `flutter build apk` -> install -> `test-raw-token` first, then full flow.
+## Docker
 
-## Security Before Public Push
+```bash
+docker build -t notification-microservice .
+docker run -p 8080:8080 \
+  -e ConnectionStrings__db="Server=<host>;Database=NotificationDb;..." \
+  -e RabbitMQ__Host="<host>" \
+  -e RabbitMQ__Username="guest" \
+  -e RabbitMQ__Password="guest" \
+  notification-microservice
+```
 
-- Gitignore + remove: `firebase-key.json`, connection strings, SMTP pass.
-- Use env vars / GitHub Actions secrets (`FIREBASE_KEY_JSON`, `RABBITMQ_HOST/USER/PASS`, `DB_CONNECTION`, `SMTP_*`).
+Secrets (DB password, SMTP credentials, `firebase-key.json`) are provided via environment variables or mounted files at deploy time — never baked into the image.
 
-## Docs
+## Roadmap
 
-- [`docs/ARCHITECTURE_FLOW.md`](docs/ARCHITECTURE_FLOW.md) - sketches + Mermaid + code mapping
-- [`BRD_NotificationMicroservice.md`](BRD_NotificationMicroservice.md) - requirements
-- [`SESSION_SUMMARY_NOTIFICATION_MICROSERVICE.md`](SESSION_SUMMARY_NOTIFICATION_MICROSERVICE.md) - handover
+- [ ] Consume `OrderPlaced` events from the Spring Boot e-commerce backend (cross-stack producer → consumer integration)
+- [ ] CI/CD pipeline (GitHub Actions: build, test, container scan, deploy)
+- [ ] Prometheus metrics + structured log correlation IDs
+- [ ] SMS channel as a third consumer
+- [ ] DLQ replay endpoint
 
+In production the identity service signs with an asymmetric key (RS256/ES256) and this service validates via its JWKS endpoint — so a validating service can never mint tokens. The local HS256 shared-secret setup is the same shape, simplified.
